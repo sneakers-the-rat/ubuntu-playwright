@@ -1,0 +1,63 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # daily: build only if sciop's playwright version has no image yet
+    - cron: "0 6 * * *"
+    # weekly: rebuild regardless, to pick up base image updates
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/ubuntu-playwright
+  LOCKFILE_URL: https://codeberg.org/safeguarding/sciop/raw/branch/main/pdm.lock
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read playwright version from sciop's lockfile
+        id: version
+        run: |
+          curl -fsSL "$LOCKFILE_URL" -o pdm.lock
+          version=$(python3 -c '
+          import tomllib
+          lock = tomllib.load(open("pdm.lock", "rb"))
+          print(next(p["version"] for p in lock["package"] if p["name"] == "playwright"))
+          ')
+          echo "playwright $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Check whether an image for this version exists
+        id: check
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 6 * * *" ] \
+            && docker manifest inspect "$IMAGE:${{ steps.version.outputs.version }}" > /dev/null 2>&1; then
+            echo "Image already exists, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v3
+        if: steps.check.outputs.skip != 'true'
+      - uses: docker/login-action@v3
+        if: steps.check.outputs.skip != 'true' && github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        if: steps.check.outputs.skip != 'true'
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: PLAYWRIGHT_VERSION=${{ steps.version.outputs.version }}
+          tags: ${{ env.IMAGE }}:latest,${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+          push: ${{ github.event_name != 'pull_request' }}
+          pull: true
+          no-cache: true
